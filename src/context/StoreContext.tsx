@@ -1,0 +1,300 @@
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import {
+  collection,
+  getDocs,
+  getDoc,
+  doc,
+  setDoc,
+  deleteDoc,
+  updateDoc,
+} from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
+import { db, auth, handleFirestoreError, OperationType } from '../firebase/config';
+import { Product, Category, StoreSettings } from '../types';
+import {
+  INITIAL_CATEGORIES,
+  INITIAL_PRODUCTS,
+  INITIAL_SETTINGS,
+  seedDatabaseIfEmpty,
+} from '../firebase/seed';
+
+interface StoreContextType {
+  products: Product[];
+  categories: Category[];
+  settings: StoreSettings;
+  loading: boolean;
+  addProduct: (prod: Omit<Product, 'id' | 'createdAt' | 'updatedAt'>) => Promise<string>;
+  updateProduct: (id: string, data: Partial<Product>) => Promise<void>;
+  deleteProduct: (id: string) => Promise<void>;
+  addCategory: (cat: Category) => Promise<void>;
+  updateCategory: (id: string, data: Partial<Category>) => Promise<void>;
+  deleteCategory: (id: string) => Promise<void>;
+  updateSettings: (data: Partial<StoreSettings>) => Promise<void>;
+  getProductById: (id: string) => Product | undefined;
+  getProductBySlug: (slug: string) => Product | undefined;
+}
+
+const StoreContext = createContext<StoreContextType | undefined>(undefined);
+
+const DEPRECATED_CATALOG_IDS = new Set([
+  'raw-silk-trousers',
+  'cotton-stretch-pajama',
+  'traditional-pleated-shalwar',
+  'tulip-cutwork-shalwar',
+  'classic-lawn-shalwar-kameez-2pc',
+  'festive-karandi-shalwar-kameez',
+  'summer-schiffli-kurti',
+  'winter-khaddar-kurta',
+  'gracia-mint-unstitched',
+]);
+
+export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [products, setProducts] = useState<Product[]>(INITIAL_PRODUCTS);
+  const [categories, setCategories] = useState<Category[]>(INITIAL_CATEGORIES);
+  const [settings, setSettings] = useState<StoreSettings>(INITIAL_SETTINGS);
+  const [loading, setLoading] = useState(false);
+
+  // Initial database check & seed when authenticated admin logs in
+  useEffect(() => {
+    const unsubAuth = onAuthStateChanged(auth, (currentUser) => {
+      if (currentUser && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+        seedDatabaseIfEmpty().catch(console.warn);
+      }
+    });
+    return () => unsubAuth();
+  }, []);
+
+  // Load Products, Categories, and Store Settings via fast single-RPC reads (avoids unauthenticated Watch stream timeouts)
+  useEffect(() => {
+    let active = true;
+
+    async function loadStorefrontCatalog() {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        return;
+      }
+      try {
+        const [productsSnap, categoriesSnap, settingsSnap] = await Promise.all([
+          getDocs(collection(db, 'products')),
+          getDocs(collection(db, 'categories')),
+          getDoc(doc(db, 'store_settings', 'general')),
+        ]);
+
+        if (!active) return;
+
+        if (!productsSnap.empty) {
+          const dbProdsMap = new Map<string, Product>();
+          const customProds: Product[] = [];
+          productsSnap.forEach((docSnap) => {
+            if (DEPRECATED_CATALOG_IDS.has(docSnap.id)) return;
+            const data = { ...docSnap.data(), id: docSnap.id } as Product;
+            dbProdsMap.set(docSnap.id, data);
+            if (!INITIAL_PRODUCTS.some((ip) => ip.id === docSnap.id)) {
+              customProds.push(data);
+            }
+          });
+          const merged = INITIAL_PRODUCTS.map((p) => {
+            const dbItem = dbProdsMap.get(p.id);
+            if (!dbItem) return p;
+            return {
+              ...p,
+              ...dbItem,
+              name: p.name,
+              description: p.description,
+              brand: p.brand || dbItem.brand,
+              type: p.type || dbItem.type,
+              fabric: p.fabric || dbItem.fabric,
+              category: p.category,
+              subcategory: p.subcategory,
+              additionalCategories: p.additionalCategories,
+              season: p.season,
+              isStitched: p.isStitched,
+              isNewArrival: p.isNewArrival,
+              isBestSeller: p.isBestSeller,
+              isFeatured: p.isFeatured,
+              defaultColor: p.defaultColor,
+              colors: p.colors,
+            };
+          });
+          setProducts([...merged, ...customProds]);
+        } else {
+          setProducts(INITIAL_PRODUCTS);
+        }
+
+        if (!categoriesSnap.empty) {
+          const initialMap = new Map(INITIAL_CATEGORIES.map((c) => [c.id, c]));
+          const cats: Category[] = [];
+          categoriesSnap.forEach((docSnap) => {
+            const data = { ...docSnap.data(), id: docSnap.id } as Category;
+            const init = initialMap.get(data.id);
+            if (init && init.image && init.image.startsWith('/assets/')) {
+              data.image = init.image;
+            }
+            cats.push(data);
+          });
+          for (const init of INITIAL_CATEGORIES) {
+            if (!cats.some((c) => c.id === init.id)) {
+              cats.push(init);
+            }
+          }
+          cats.sort((a, b) => a.order - b.order);
+          setCategories(cats);
+        } else {
+          setCategories(INITIAL_CATEGORIES);
+        }
+
+        if (settingsSnap.exists()) {
+          const loaded = settingsSnap.data() as StoreSettings;
+          const helplineDigits = (loaded.helpline || '').replace(/[^0-9]/g, '');
+          const whatsappDigits = (loaded.whatsapp || '').replace(/[^0-9]/g, '');
+          setSettings({
+            ...INITIAL_SETTINGS,
+            ...loaded,
+            helpline:
+              !loaded.helpline || helplineDigits.endsWith('3280547200')
+                ? INITIAL_SETTINGS.helpline
+                : loaded.helpline,
+            whatsapp:
+              !loaded.whatsapp || whatsappDigits.endsWith('3280547200')
+                ? INITIAL_SETTINGS.whatsapp
+                : loaded.whatsapp,
+            email:
+              !loaded.email || loaded.email === 'support@noorstudio.pk'
+                ? INITIAL_SETTINGS.email
+                : loaded.email,
+            announcement: loaded.announcement?.match(/0328-?0547200/)
+              ? loaded.announcement.replace(/0328-?0547200/g, '03284454746')
+              : loaded.announcement || INITIAL_SETTINGS.announcement,
+          });
+        }
+      } catch (error) {
+        console.warn('Catalog load note, using complete local catalog', error);
+        if (active) {
+          setProducts(INITIAL_PRODUCTS);
+          setCategories(INITIAL_CATEGORIES);
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadStorefrontCatalog();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const addProduct = async (prodData: Omit<Product, 'id' | 'createdAt' | 'updatedAt'>) => {
+    const id = `ns-prod-${Date.now()}`;
+    const newProd: Product = {
+      ...prodData,
+      id,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    setProducts((prev) => [newProd, ...prev]);
+    try {
+      await setDoc(doc(db, 'products', id), newProd);
+      return id;
+    } catch (err) {
+      console.info('Product saved locally & queued for Firestore sync', err);
+      return id;
+    }
+  };
+
+  const updateProduct = async (id: string, data: Partial<Product>) => {
+    setProducts((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, ...data, updatedAt: new Date().toISOString() } : p))
+    );
+    try {
+      await updateDoc(doc(db, 'products', id), {
+        ...data,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.info('Product updated locally & queued for Firestore sync', err);
+    }
+  };
+
+  const deleteProduct = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'products', id));
+      setProducts((prev) => prev.filter((p) => p.id !== id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `products/${id}`);
+    }
+  };
+
+  const addCategory = async (cat: Category) => {
+    try {
+      await setDoc(doc(db, 'categories', cat.id), cat);
+      setCategories((prev) => [...prev, cat].sort((a, b) => a.order - b.order));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `categories/${cat.id}`);
+    }
+  };
+
+  const updateCategory = async (id: string, data: Partial<Category>) => {
+    try {
+      await updateDoc(doc(db, 'categories', id), data);
+      setCategories((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...data } : c)).sort((a, b) => a.order - b.order)
+      );
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `categories/${id}`);
+    }
+  };
+
+  const deleteCategory = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'categories', id));
+      setCategories((prev) => prev.filter((c) => c.id !== id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `categories/${id}`);
+    }
+  };
+
+  const updateSettings = async (data: Partial<StoreSettings>) => {
+    try {
+      await setDoc(doc(db, 'store_settings', 'general'), data, { merge: true });
+      setSettings((prev) => ({ ...prev, ...data }));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, 'store_settings/general');
+    }
+  };
+
+  const getProductById = (id: string) => products.find((p) => p.id === id);
+  const getProductBySlug = (slug: string) => products.find((p) => p.slug === slug || p.id === slug);
+
+  return (
+    <StoreContext.Provider
+      value={{
+        products,
+        categories,
+        settings,
+        loading,
+        addProduct,
+        updateProduct,
+        deleteProduct,
+        addCategory,
+        updateCategory,
+        deleteCategory,
+        updateSettings,
+        getProductById,
+        getProductBySlug,
+      }}
+    >
+      {children}
+    </StoreContext.Provider>
+  );
+};
+
+export const useStore = () => {
+  const context = useContext(StoreContext);
+  if (!context) {
+    throw new Error('useStore must be used within a StoreProvider');
+  }
+  return context;
+};
